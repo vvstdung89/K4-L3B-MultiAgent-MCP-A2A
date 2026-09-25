@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import OUTPUT_SCHEMA_VERSION
-from .a2a import CaseContext, Evidence
+from .a2a import CaseContext, Evidence, EvidenceUnavailable
 from .analysis import (
     EntityDecision,
     IncidentScope,
@@ -217,6 +217,10 @@ async def policy_agent(ctx: CaseContext, f: Findings) -> None:
     policy = None
     if version:
         policy = _ref(ctx, f, await ctx.fetch(actor, "get_policy", policy_version=version))
+    if version and policy is None:
+        # The public policy is global and must always resolve; if it does not, the gateway
+        # is unhealthy (outage or quota) and every other result of this case is suspect.
+        raise EvidenceUnavailable(f"{ctx.case_id}: get_policy returned no evidence")
     rules = policy.get("rules", {}) if isinstance(policy, dict) else {}
     rule = rules.get(f.issue)
     f.rule = dict(rule) if isinstance(rule, dict) else dict(FALLBACK_RULE)

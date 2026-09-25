@@ -6,7 +6,7 @@ import json
 import sys
 from pathlib import Path
 
-from .a2a import PermissionDenied
+from .a2a import EvidenceUnavailable, PermissionDenied
 from .cases import load_case_set
 from .config import Settings
 from .contracts import Contracts
@@ -37,12 +37,14 @@ async def _run(root: Path) -> None:
     contracts = Contracts(root / "contracts" / "schemas")
     output_root = root / "outputs"
     trace_path = root / "traces" / "trace.jsonl"
-    output_root.mkdir(parents=True, exist_ok=True)
+    # Stage the whole run; previous artifacts are replaced only when every case succeeded.
+    staging = output_root / ".staging"
+    staged_trace = staging / "trace.jsonl"
+    staging.mkdir(parents=True, exist_ok=True)
     trace_path.parent.mkdir(parents=True, exist_ok=True)
-    for stale in output_root.glob("*.json"):
+    for stale in staging.iterdir():
         stale.unlink()
-    trace_path.unlink(missing_ok=True)
-    trace = TraceWriter(trace_path, contracts)
+    trace = TraceWriter(staged_trace, contracts)
 
     llm_settings = LLMSettings.from_env()
     llm = OrchestratorLLM(llm_settings) if llm_settings else None
@@ -76,7 +78,7 @@ async def _run(root: Path) -> None:
                     contracts.validate_output(output, f"outputs/{case_id}.json")
                     if output.get("case_id") != case_id:
                         raise ValueError(f"solver returned a mismatched case_id for {case_id}")
-                    target = output_root / f"{case_id}.json"
+                    target = staging / f"{case_id}.json"
                     temporary = target.with_suffix(".json.tmp")
                     temporary.write_text(
                         json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
@@ -85,7 +87,7 @@ async def _run(root: Path) -> None:
                     trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
                     pending.pop(0)
                     print(f"[{len(case_set.case_ids) - len(pending):3d}] {case_id}", flush=True)
-        except (ValueError, KeyError, PermissionDenied):
+        except (ValueError, KeyError, PermissionDenied, EvidenceUnavailable):
             raise
         except Exception as exc:  # the MCP session died (server disconnect, network reset)
             reconnects += 1
@@ -96,6 +98,13 @@ async def _run(root: Path) -> None:
     if llm is not None:
         print(f"LLM calls: {llm.calls}, tokens: {llm.tokens}", flush=True)
         await llm.aclose()
+
+    for stale in output_root.glob("*.json"):
+        stale.unlink()
+    for case_id in case_set.case_ids:
+        (staging / f"{case_id}.json").replace(output_root / f"{case_id}.json")
+    staged_trace.replace(trace_path)
+    staging.rmdir()
 
 
 def parser() -> argparse.ArgumentParser:

@@ -35,6 +35,10 @@ class PermissionDenied(RuntimeError):
     pass
 
 
+class EvidenceUnavailable(RuntimeError):
+    """The gateway refuses evidence that must always exist; abort instead of guessing."""
+
+
 class TransportFailure(ConnectionError):
     """MCP transport failed after the retry budget; the case must be re-run."""
 
