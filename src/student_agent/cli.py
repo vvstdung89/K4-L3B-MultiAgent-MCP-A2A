@@ -23,6 +23,13 @@ def _root(value: str) -> Path:
     return Path(value).resolve()
 
 
+def _leaf(exc: BaseException) -> BaseException:
+    """The first underlying error of a (nested) exception group from the MCP task groups."""
+    while isinstance(exc, BaseExceptionGroup) and exc.exceptions:
+        exc = exc.exceptions[0]
+    return exc
+
+
 async def _show_tools(root: Path) -> None:
     settings = Settings.load(root)
     contracts = Contracts(root / "contracts" / "schemas")
@@ -56,7 +63,6 @@ async def _run(root: Path) -> None:
         flush=True,
     )
     pending = list(case_set.case_ids)
-    received: set[str] = set()
     reconnects = 0
     while pending:
         try:
@@ -69,9 +75,8 @@ async def _run(root: Path) -> None:
                 while pending:
                     case_id = pending[0]
                     case = case_set.cases[case_id]
-                    if case_id not in received:
-                        trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
-                        received.add(case_id)
+                    trace.begin_case()
+                    trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
                     output = await solve_case(
                         case, gateway, trace, frozenset(discovered_tools), llm
                     )
@@ -85,15 +90,24 @@ async def _run(root: Path) -> None:
                     )
                     temporary.replace(target)
                     trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+                    trace.commit_case()
                     pending.pop(0)
                     print(f"[{len(case_set.case_ids) - len(pending):3d}] {case_id}", flush=True)
         except (ValueError, KeyError, PermissionDenied, EvidenceUnavailable):
             raise
         except Exception as exc:  # the MCP session died (server disconnect, network reset)
+            cause = _leaf(exc)
+            if isinstance(cause, (ValueError, KeyError, PermissionDenied, EvidenceUnavailable)):
+                # Not a transport failure: retrying only burns audited MCP calls.
+                raise RuntimeError(f"{type(cause).__name__}: {cause}") from exc
+            trace.discard_case()  # the case is re-investigated from scratch in a new session
             reconnects += 1
             if reconnects > MAX_RECONNECTS:
                 raise RuntimeError(f"MCP session failed {reconnects} times") from exc
-            print(f"session lost ({type(exc).__name__}); reconnect {reconnects}", file=sys.stderr)
+            print(
+                f"session lost ({type(cause).__name__}: {cause}); reconnect {reconnects}",
+                file=sys.stderr,
+            )
             await asyncio.sleep(2.0 * reconnects)
     if llm is not None:
         print(f"LLM calls: {llm.calls}, tokens: {llm.tokens}", flush=True)

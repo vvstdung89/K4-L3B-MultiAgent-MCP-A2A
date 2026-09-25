@@ -49,6 +49,14 @@ PAYMENT_ISSUES = {
     "unsupported_claim",
 }
 REFUND_ISSUES = {"refund_pending", "refund_failed"}
+DELIVERY_TOPICS = {"late_delivery_seller", "late_delivery_logistics", "unsupported_claim"}
+PAYMENT_TOPICS = {
+    "valid_split_payment",
+    "payment_mismatch",
+    "duplicate_charge",
+    "canceled_order_paid",
+    "unavailable_order_paid",
+}
 SELLER_ISSUES = {"late_delivery_seller", "unavailable_order_paid"}
 FULL_REFUND_TOPIC = "requested_full_refund"
 # Issues where policy returns everything the customer paid (not only freight/difference).
@@ -148,15 +156,14 @@ async def order_agent(ctx: CaseContext, f: Findings) -> None:
     assert f.order_id and f.incident
     items = _ref(ctx, f, await ctx.fetch(actor, "get_order_items", order_id=f.order_id))
     f.items = scoped_items(items if isinstance(items, list) else [], f.incident)
-    if ctx.case.get("investigation_scope", {}).get("include_product_context"):
-        _ref(ctx, f, await ctx.fetch(actor, "get_product_context", order_id=f.order_id))
+    # Product context never changes a verdict here, so it is not fetched (efficiency).
     ctx.send(
         actor,
         "coordinator",
         "order_items_scoped",
         {"items": len(f.items)},
         decision_code="ITEMS_SCOPED" if f.items else "ITEMS_MISSING",
-        evidence_refs=_refs(f, "get_order_items", "get_product_context"),
+        evidence_refs=_refs(f, "get_order_items"),
     )
 
 
@@ -173,10 +180,14 @@ async def seller_check(ctx: CaseContext, f: Findings) -> None:
     )
 
 
-async def shipment_agent(ctx: CaseContext, f: Findings) -> None:
+async def shipment_agent(ctx: CaseContext, f: Findings, *, fetch: bool = True) -> None:
+    """Delivery verdicts come from the order timeline plus item shipping limits; the
+    shipment summary (carrier events) is fetched only when a delivery claim is examined."""
     actor = "shipment-agent"
     assert f.order_id and f.incident
-    shipment = _ref(ctx, f, await ctx.fetch(actor, "get_shipment_summary", order_id=f.order_id))
+    shipment = None
+    if fetch:
+        shipment = _ref(ctx, f, await ctx.fetch(actor, "get_shipment_summary", order_id=f.order_id))
     f.shipment = analyse_shipment(
         f.incident, f.items, shipment if isinstance(shipment, dict) else None
     )
@@ -190,16 +201,20 @@ async def shipment_agent(ctx: CaseContext, f: Findings) -> None:
     )
 
 
-async def payment_agent(ctx: CaseContext, f: Findings) -> None:
+async def payment_agent(ctx: CaseContext, f: Findings, *, refunds: bool = True) -> None:
     actor = "payment-agent"
     assert f.order_id and f.incident
     timeline = _ref(ctx, f, await ctx.fetch(actor, "get_payment_timeline", order_id=f.order_id))
-    refunds = _ref(ctx, f, await ctx.fetch(actor, "get_refund_timeline", order_id=f.order_id))
+    refund_data = None
+    if refunds:
+        refund_data = _ref(
+            ctx, f, await ctx.fetch(actor, "get_refund_timeline", order_id=f.order_id)
+        )
     f.payment = analyse_payment(
         f.incident,
         f.items,
         timeline if isinstance(timeline, dict) else None,
-        refunds if isinstance(refunds, dict) else None,
+        refund_data if isinstance(refund_data, dict) else None,
     )
     ctx.send(
         actor,
@@ -448,17 +463,25 @@ def conflict_resolver(ctx: CaseContext, f: Findings) -> list[dict[str, Any]]:
                         "resolution_code": "TEMPORAL_SCOPE_BEFORE_OPENED_AT",
                     }
                 )
-    if len(f.candidates) > 1:
+    # Only sources actually consulted may be cited: a conflict source without evidence
+    # behind it is unverifiable.
+    consulted = [
+        tool
+        for tool in ("get_payment_timeline", "get_refund_timeline", "get_shipment_summary")
+        if tool in f.refs
+    ]
+    if len(f.candidates) > 1 and len(consulted) > 1:
+        selected = {
+            "refund_failed": "get_refund_timeline",
+            "refund_pending": "get_refund_timeline",
+            "late_delivery_seller": "get_shipment_summary",
+            "late_delivery_logistics": "get_shipment_summary",
+        }.get(f.issue, "get_payment_timeline")
         conflicts.append(
             {
                 "field": "primary_issue",
-                "sources": ["get_payment_timeline", "get_refund_timeline", "get_shipment_summary"],
-                "selected_source": {
-                    "refund_failed": "get_refund_timeline",
-                    "refund_pending": "get_refund_timeline",
-                    "late_delivery_seller": "get_shipment_summary",
-                    "late_delivery_logistics": "get_shipment_summary",
-                }.get(f.issue, "get_payment_timeline"),
+                "sources": consulted,
+                "selected_source": selected if selected in consulted else consulted[0],
                 "resolution_code": "SCOPED_TO_CLAIMED_INCIDENT",
             }
         )
@@ -495,13 +518,13 @@ def conflict_resolver(ctx: CaseContext, f: Findings) -> list[dict[str, Any]]:
 
 def _issue_evidence(f: Findings) -> list[str]:
     tools = ["get_customer_history", "get_order", "get_order_items", "get_policy"]
-    if "get_product_context" in f.refs:
-        tools.append("get_product_context")
-    if f.issue in SHIPMENT_ISSUES or f.issue in {"canceled_order_paid", "unavailable_order_paid"}:
+    # Evidence follows the data: any domain with events inside the incident window is
+    # relevant to the conclusion, whatever the primary issue is.
+    if f.issue in SHIPMENT_ISSUES or (f.shipment and f.shipment.events_in_scope):
         tools.append("get_shipment_summary")
     if f.issue in PAYMENT_ISSUES:
         tools.append("get_payment_timeline")
-    if f.issue in REFUND_ISSUES:
+    if f.issue in REFUND_ISSUES or f.payment.refund_events_in_scope:
         tools.append("get_refund_timeline")
     if f.issue in SELLER_ISSUES:
         tools.append("get_sellers")
@@ -755,13 +778,39 @@ async def solve_case(
     await entity_agent(ctx, f)
 
     if f.order_id and f.incident is not None:
+        # Hypothesis-driven investigation: fetch what the claim needs, expand only if the
+        # evidence gathered so far does not support it.
+        claimed = _primary_claim_topic(ctx.case)
+        need_shipment = claimed in DELIVERY_TOPICS
+        # Refund lifecycle can overlap any payment incident (e.g. a failed refund inside
+        # the same window as a split payment), so payment claims consult it too.
+        need_refunds = claimed in REFUND_ISSUES | PAYMENT_TOPICS
         ctx.assign("order-agent", "scope_order_items")
         await order_agent(ctx, f)
         ctx.assign("shipment-agent", "analyse_shipment")
-        await shipment_agent(ctx, f)
+        await shipment_agent(ctx, f, fetch=need_shipment)
         ctx.assign("payment-agent", "analyse_payment_refund")
-        await payment_agent(ctx, f)
+        await payment_agent(ctx, f, refunds=need_refunds)
         select_hypothesis(ctx, f)
+        # Competing anomalies in the scope must be weighed against every domain, so they
+        # expand the investigation just like an unsupported claim does.
+        competing = len(f.candidates) > 1
+        if (f.issue != claimed or competing) and not (need_shipment and need_refunds):
+            ctx.send(
+                "coordinator",
+                "coordinator",
+                "expand_investigation",
+                decision_code="COMPETING_ANOMALIES_EXPAND"
+                if f.issue == claimed
+                else "CLAIM_UNSUPPORTED_EXPAND",
+            )
+            if not need_shipment:
+                ctx.assign("shipment-agent", "analyse_shipment")
+                await shipment_agent(ctx, f, fetch=True)
+            if not need_refunds:
+                ctx.assign("payment-agent", "analyse_refunds")
+                await payment_agent(ctx, f, refunds=True)
+            select_hypothesis(ctx, f)
         if llm is not None and f.evaluated:
             ctx.assign("llm-reviewer", "review_hypothesis")
             await llm_reviewer(ctx, f, llm)

@@ -219,9 +219,10 @@ class ShipmentFinding:
     late_seller_ids: list[str]
     timeline_complete: bool
     event_actor: str | None = None
+    events_in_scope: int = 0  # carrier events inside the incident window
 
 
-def analyse_shipment(
+def _analyse_shipment(
     incident: IncidentScope,
     items: list[dict[str, Any]],
     shipment: dict[str, Any] | None,
@@ -269,6 +270,20 @@ def analyse_shipment(
     return ShipmentFinding(verdict, late_sellers, timeline_complete, event_actor)
 
 
+def analyse_shipment(
+    incident: IncidentScope,
+    items: list[dict[str, Any]],
+    shipment: dict[str, Any] | None,
+) -> ShipmentFinding:
+    finding = _analyse_shipment(incident, items, shipment)
+    finding.events_in_scope = sum(
+        1
+        for e in (shipment or {}).get("events", []) or []
+        if incident.window.contains(e.get("event_at"))
+    )
+    return finding
+
+
 # ---------------------------------------------------------------------------
 # Payment / refund analysis
 # ---------------------------------------------------------------------------
@@ -286,6 +301,7 @@ class PaymentFinding:
     duplicate_amount: float = 0.0
     refund_amount: float = 0.0
     split_rows: list[dict[str, Any]] = field(default_factory=list)
+    refund_events_in_scope: int = 0
 
     @property
     def split(self) -> bool:
@@ -302,6 +318,29 @@ def _match_rows(captures: list[dict[str, Any]], payments: list[dict[str, Any]]):
                 rows.append(pool.pop(index))
                 break
     return rows
+
+
+def _drop_replayed_captures(
+    captures: list[dict[str, Any]], payments: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Drop captures with no payment row left that repeat the amount of a backed capture.
+
+    Unbacked captures of a different amount (e.g. a reconciliation mismatch) are kept."""
+    pool = list(payments)
+    backed_amounts: list[float] = []
+    kept: list[dict[str, Any]] = []
+    for capture in captures:
+        amount = money(capture.get("amount_brl"))
+        for index, row in enumerate(pool):
+            if same_amount(money(row.get("payment_value")), amount):
+                pool.pop(index)
+                backed_amounts.append(amount)
+                kept.append(capture)
+                break
+        else:
+            if not any(same_amount(amount, a) for a in backed_amounts):
+                kept.append(capture)
+    return kept
 
 
 def _split_subset(rows: list[dict[str, Any]], expected: float) -> list[dict[str, Any]]:
@@ -339,6 +378,12 @@ def analyse_payment(
         for e in (refund_timeline or {}).get("events", []) or []
         if incident.window.contains(e.get("event_at"))
     ]
+    payments = list(payment_timeline.get("payments", []) or [])
+    rows = _match_rows(captures, payments)
+    if payments and len(rows) < len(captures):
+        # A capture with no payment row behind it is a replayed timeline record, not a
+        # second charge: a real duplicate charge carries its own payment row.
+        captures = _drop_replayed_captures(captures, payments)
     captured_total = round(sum(money(e.get("amount_brl")) for e in captures), 2)
     refunded_total = round(
         sum(
@@ -348,10 +393,10 @@ def analyse_payment(
         ),
         2,
     )
-    rows = _match_rows(captures, list(payment_timeline.get("payments", []) or []))
     expected = round(sum(money(i.get("price")) + money(i.get("freight_value")) for i in items), 2)
 
     finding = PaymentFinding("reconciled", captured_total, refunded_total, captures, rows)
+    finding.refund_events_in_scope = len(refunds)
     failed = [e for e in refunds if e.get("status") == "failed"]
     pending = [e for e in refunds if e.get("status") in {"pending", "open", "processing"}]
     if failed:

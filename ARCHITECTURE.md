@@ -11,7 +11,7 @@ case input
 coordinator ──task_assigned──▶ entity-agent ── get_customer_history, get_order
    │                               │ rank candidates, build order incarnations (scopes)
    │◀──────────handoff─────────────┘
-   ├─task──▶ order-agent ──── get_order_items, get_product_context
+   ├─task──▶ order-agent ──── get_order_items
    ├─task──▶ shipment-agent ─ get_shipment_summary
    ├─task──▶ payment-agent ── get_payment_timeline, get_refund_timeline
    │          (each hands its verdict back to coordinator)
@@ -40,7 +40,7 @@ Source:
 | --- | --- | --- | --- | --- |
 | Entity/customer | case input (candidates, claimed id, customer hint) | resolve order, reject candidate ngoài history, dựng các scope (incarnation) của order | `get_customer_history`, `get_order` | `entity_resolved` → coordinator |
 | Coordinator | handoff của specialist | giao task, re-scope evidence theo từng incarnation, kiểm chứng claim, quyết định escalate LLM | không gọi MCP | task_assigned / hypothesis_selected |
-| Order/product | order id, scope | lấy item/seller/product, lọc item thuộc incident | `get_order_items`, `get_product_context`, `get_sellers` | `order_items_scoped`, `seller_confirmed` |
+| Order/product | order id, scope | lấy item/seller, lọc item thuộc incident | `get_order_items`, `get_sellers` (`get_product_context` được phép nhưng không dùng) | `order_items_scoped`, `seller_confirmed` |
 | Shipment | scope, items | on_time / seller_delay / logistics_delay / conflicting | `get_shipment_summary` | `shipment_analysed` |
 | Payment/refund | scope, items | capture, split, duplicate, mismatch, refund lifecycle | `get_payment_timeline`, `get_refund_timeline` | `payment_analysed` |
 | LLM reviewer | fact sheet có cấu trúc (không có free-text khiếu nại) | review độc lập; chỉ được chọn trong tập issue có evidence | không gọi MCP | handoff `LLM_*` → coordinator |
@@ -64,7 +64,7 @@ Permission được enforce trong `a2a.TOOL_PERMISSIONS`; gọi tool ngoài quy�
 1. `EvidenceGateway.call` validate response theo `mcp-evidence-response-v1`; response sai contract bị bỏ (`INVALID_EVIDENCE`), không dùng.
 2. `CaseContext.fetch` cache theo `(tool, arguments)` trong phạm vi một case và emit `tool_result_consumed` kèm `evidence_ref`. Context bị huỷ khi case kết thúc nên evidence không thể dùng chéo case.
 3. Tool báo lỗi (ví dụ order không có refund event) được ghi `NO_EVIDENCE`, không retry, không bịa dữ liệu.
-4. Output `evidence_refs` chỉ gồm các domain liên quan đến primary issue (core: customer, order, item, policy, product; thêm shipment / payment / refund / seller theo issue). Claim assessment dẫn đến evidence cụ thể.
+4. Output `evidence_refs` theo dữ liệu: domain của primary issue, cộng với mọi domain có event nằm trong cửa sổ incident (ví dụ refund failed chồng lên split payment) dù không phải primary issue (core: customer, order, item, policy; thêm shipment / payment / refund / seller theo issue). Claim assessment dẫn đến evidence cụ thể.
 5. `data_conflicts`:
    - `get_order` vs `get_customer_history` khác nhau ở status/timestamp → chọn history, `TEMPORAL_SCOPE_BEFORE_OPENED_AT`;
    - nhiều anomaly cạnh tranh trong một scope → `SCOPED_TO_CLAIMED_INCIDENT`;
@@ -81,7 +81,9 @@ Permission được enforce trong `a2a.TOOL_PERMISSIONS`; gọi tool ngoài quy�
 | Source conflict | 0 | chọn source theo thứ tự ở mục 4, không resolve được → `conflicting` | `CONFLICTS_RESOLVED`, `data_conflicts` |
 | Invalid specialist / LLM result | LLM: 1 retry / model | LLM trả issue ngoài tập cho phép hoặc lỗi → bỏ qua, giữ kết quả rule | `LLM_UNAVAILABLE` |
 
-**Query budget**: 8 MCP call cho mỗi case (history, order, items, product, shipment, payment timeline, refund timeline, policy), thêm `get_sellers` chỉ khi seller chịu trách nhiệm. Không gọi `get_order_payments` (payment timeline đã chứa các dòng payment) và không gọi MCP cho candidate bị reject. Mọi phân tích lại theo scope đều dùng evidence đã cache.
+**Query budget (hypothesis-driven)**: luôn gọi 5 tool (customer history, order, items, payment timeline, policy). `get_shipment_summary` chỉ gọi khi claim là giao hàng (late_*/unsupported_claim) vì verdict giao hàng tính được từ timeline trong history + shipping limit của item. `get_refund_timeline` gọi khi claim là refund_* hoặc là claim thanh toán (split, mismatch, duplicate, canceled, unavailable), vì refund event có thể nằm chồng trong cùng cửa sổ của incident thanh toán. `get_sellers` chỉ gọi khi seller chịu trách nhiệm. Nếu evidence không hỗ trợ claim (`CLAIM_UNSUPPORTED_EXPAND`) hoặc trong scope có nhiều anomaly cạnh tranh (`COMPETING_ANOMALIES_EXPAND`), coordinator mở rộng điều tra và gọi các tool còn thiếu; `data_conflicts` chỉ trích dẫn source đã thực sự được gọi. Không gọi `get_product_context` và `get_order_payments` (không đổi kết luận nào), không gọi MCP cho candidate bị reject. Trung bình ≈ 6 call/case (bản đầu 8.3).
+
+**Trace nguyên tử theo case**: event được đệm trong bộ nhớ và chỉ ghi khi case finalize. Nếu session MCP chết giữa case, toàn bộ event và evidence ref của lần chạy dở bị bỏ, case được điều tra lại từ đầu trong session mới, nên trace không còn ref "mồ côi" thuộc run/session khác.
 
 ## 6. Verification invariants
 

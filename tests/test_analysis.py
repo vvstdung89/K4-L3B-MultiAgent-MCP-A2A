@@ -179,3 +179,31 @@ def test_canceled_order_paid() -> None:
     assert classify_issue(scope, analyse_shipment(scope, [], None), payment) == (
         "canceled_order_paid"
     )
+
+
+def test_replayed_capture_without_payment_row_is_not_a_second_charge() -> None:
+    real = _row("2017-12-20", "2017-12-22", None, "2017-12-30", status="unavailable")
+    scope = select_incident(OID, _history(real), None, CASE["opened_at"])
+    row = {"payment_sequential": "1", "payment_type": "credit_card", "payment_value": "89.00"}
+    payment = analyse_payment(
+        scope,
+        [_item("2017-12-23")],
+        {"payments": [row], "events": [_capture("2017-12-20", "89.00")] * 2},
+        None,
+    )
+    assert payment.captured_total == 89.0 and "duplicate_capture" not in payment.anomalies
+    assert classify_issue(scope, analyse_shipment(scope, [], None), payment) == (
+        "unavailable_order_paid"
+    )
+
+    # A real duplicate charge carries its own payment row and is still detected.
+    duplicate = analyse_payment(
+        scope,
+        [_item("2017-12-23")],
+        {
+            "payments": [row, {**row, "payment_sequential": "2"}],
+            "events": [_capture("2017-12-20", "89.00")] * 2,
+        },
+        None,
+    )
+    assert duplicate.captured_total == 178.0 and "duplicate_capture" in duplicate.anomalies
