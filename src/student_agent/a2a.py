@@ -97,7 +97,7 @@ class CaseContext:
         seq = next(self._seq)
         envelope = Envelope(
             case_id=self.case_id,
-            message_id=f"{self.case_id}:msg:{seq}",
+            message_id=f"msg:{seq}",  # correlated by the event case_id
             correlation_id=self.case_id,
             sender=sender,
             recipient=recipient,
@@ -113,7 +113,7 @@ class CaseContext:
             target=recipient,
             decision_code=decision_code or intent,
             evidence_refs=refs or None,
-            attributes={"message_id": envelope.message_id, "intent": intent},
+            attributes={"message_id": envelope.message_id},  # intent == decision_code by default
         )
         return envelope
 
@@ -187,7 +187,10 @@ class CaseContext:
                     actor=actor,
                     tool_name=tool,
                     evidence_refs=[result.ref],
-                    attributes={"domain": result.domain, "warnings": len(result.warnings)},
+                    attributes={
+                        "domain": result.domain,
+                        **({"warnings": len(result.warnings)} if result.warnings else {}),
+                    },
                 )
                 break
         self.evidence[key] = result
