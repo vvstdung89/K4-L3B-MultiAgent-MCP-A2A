@@ -9,6 +9,7 @@ Ngoài kết luận nghiệp vụ, yêu cầu cần phải xử lý xử lý ent
 ## Dữ liệu
 
 Tham khảo dữ liệu tại: https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce
+với dữ liệu ở D:\downloads\Git\K4-L3B-MultiAgent-MCP-A2A\inputs\inputs
 
 ## Quy tắc đặt tên
 

@@ -18,11 +18,11 @@ htmlcov/
 
 # Competition runtime artifacts
 case-set.json
-inputs/*
+inputs/
 !inputs/.gitkeep
-outputs/*
+outputs/
 !outputs/.gitkeep
-traces/*
+traces/
 !traces/.gitkeep
 dist/*
 !dist/.gitkeep

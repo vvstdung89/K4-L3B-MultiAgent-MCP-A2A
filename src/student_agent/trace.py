@@ -16,6 +16,21 @@ class TraceWriter:
         self.path = path
         self.contracts = contracts
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._buffer: list[str] | None = None
+
+    # A case is written atomically: events stay in memory until the case finalizes, so an
+    # attempt aborted by a transport failure leaves no orphan events or evidence refs.
+    def begin_case(self) -> None:
+        self._buffer = []
+
+    def commit_case(self) -> None:
+        lines, self._buffer = self._buffer or [], None
+        if lines:
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write("".join(lines))
+
+    def discard_case(self) -> None:
+        self._buffer = None
 
     def emit(
         self,
@@ -46,6 +61,10 @@ class TraceWriter:
         }
         event.update({key: value for key, value in optional.items() if value is not None})
         self.contracts.validate_trace(event, "trace event")
-        with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
+        line = json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
+        if self._buffer is not None:
+            self._buffer.append(line)
+        else:
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(line)
         return event
