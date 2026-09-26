@@ -124,6 +124,58 @@ def test_payment_verdicts() -> None:
         "valid_split_payment"
     )
 
+    # Split legs may share payment_sequential; they are distinct rows, not a replay.
+    same_sequence = analyse_payment(
+        scope,
+        items,
+        {
+            "payments": [
+                {"payment_sequential": "1", "payment_type": "credit_card", "payment_value": "44.50"},
+                {"payment_sequential": "1", "payment_type": "voucher", "payment_value": "44.50"},
+            ],
+            "events": [_capture("2017-12-20", "44.50"), _capture("2017-12-20", "44.50")],
+        },
+        None,
+    )
+    assert same_sequence.captured_total == 89.0 and same_sequence.split
+
+    # Another incarnation sharing the window (same timestamps): its 52 capture and its
+    # failed 52 refund are not part of the split incident.
+    collided = analyse_payment(
+        scope,
+        items,
+        {
+            "payments": [
+                {"payment_sequential": "1", "payment_type": "credit_card", "payment_value": "52.00"},
+                {"payment_sequential": "1", "payment_type": "credit_card", "payment_value": "44.50"},
+                {"payment_sequential": "2", "payment_type": "voucher", "payment_value": "44.50"},
+            ],
+            "events": [
+                _capture("2017-12-20", "52.00"),
+                _capture("2017-12-20", "44.50"),
+                _capture("2017-12-20", "44.50"),
+            ],
+        },
+        {"events": [{"event_at": "2017-12-21T09:00:00-03:00", "amount_brl": "52.00", "status": "failed"}]},
+    )
+    assert collided.captured_total == 89.0 and collided.split
+    assert collided.anomalies == [] and collided.refund_events_in_scope == 0
+
+    # A full-amount duplicate charge repeats the incident's own amount: never attributed away.
+    full_duplicate = analyse_payment(
+        scope,
+        items,
+        {
+            "payments": [
+                {"payment_sequential": "1", "payment_type": "credit_card", "payment_value": "89.00"},
+                {"payment_sequential": "2", "payment_type": "credit_card", "payment_value": "89.00"},
+            ],
+            "events": [_capture("2017-12-20", "89.00"), _capture("2017-12-20", "89.00")],
+        },
+        None,
+    )
+    assert full_duplicate.captured_total == 178.0
+
     duplicate = analyse_payment(
         scope,
         items,
@@ -207,3 +259,13 @@ def test_replayed_capture_without_payment_row_is_not_a_second_charge() -> None:
         None,
     )
     assert duplicate.captured_total == 178.0 and "duplicate_capture" in duplicate.anomalies
+
+    # The source may replay the payment row itself (same payment_sequential): still one charge.
+    replayed_row = analyse_payment(
+        scope,
+        [_item("2017-12-23")],
+        {"payments": [row, dict(row)], "events": [_capture("2017-12-20", "89.00")] * 2},
+        None,
+    )
+    assert replayed_row.captured_total == 89.0
+    assert "duplicate_capture" not in replayed_row.anomalies

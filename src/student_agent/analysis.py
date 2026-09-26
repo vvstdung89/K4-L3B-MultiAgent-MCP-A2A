@@ -245,7 +245,9 @@ def _analyse_shipment(
     )
 
     if status in {"canceled", "unavailable"}:
-        return ShipmentFinding("insufficient_evidence", [], False, event_actor)
+        # Handed to the carrier and never delivered by the estimate: the parcel is lost.
+        verdict = "lost" if carrier and delivered is None else "insufficient_evidence"
+        return ShipmentFinding(verdict, [], False, event_actor)
     if status != "delivered" or delivered is None or estimated is None:
         return ShipmentFinding("insufficient_evidence", [], timeline_complete, event_actor)
 
@@ -320,6 +322,20 @@ def _match_rows(captures: list[dict[str, Any]], payments: list[dict[str, Any]]):
     return rows
 
 
+def _unique_payment_rows(payments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop exact copies of a payment row: an identical row is the same payment replayed by
+    the source, not a second charge. Rows may share payment_sequential and still differ
+    (the legs of a split payment carry different payment types), so only full copies merge."""
+    seen: set[Any] = set()
+    rows: list[dict[str, Any]] = []
+    for row in payments:
+        key = tuple(sorted((k, str(v)) for k, v in row.items()))
+        if key not in seen:
+            seen.add(key)
+            rows.append(row)
+    return rows
+
+
 def _drop_replayed_captures(
     captures: list[dict[str, Any]], payments: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -341,6 +357,51 @@ def _drop_replayed_captures(
             if not any(same_amount(amount, a) for a in backed_amounts):
                 kept.append(capture)
     return kept
+
+
+def _attribute_to_incident(
+    captures: list[dict[str, Any]], refunds: list[dict[str, Any]], expected: float
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Keep only the money movements that belong to the incident's own incarnation.
+
+    Another incarnation of the same order can share the incident window (identical
+    timestamps). When a subset of the captures settles the incident's items exactly, the
+    remaining captures belong to that other incarnation, and so do refunds of their
+    amounts. A refund larger than everything the incident captured cannot be its own."""
+    settling = _settling_captures(captures, expected)
+    own = [money(c.get("amount_brl")) for c in settling]
+    rest = [c for c in captures if not any(c is s for s in settling)]
+    # A repeat of an own amount is a duplicate charge of this incident, not a foreign one.
+    foreign = [
+        money(c.get("amount_brl"))
+        for c in rest
+        if not any(same_amount(money(c.get("amount_brl")), a) for a in own)
+    ]
+    if settling and foreign and len(foreign) == len(rest):
+        captures = settling
+        refunds = [
+            r
+            for r in refunds
+            if not (
+                any(same_amount(money(r.get("amount_brl")), a) for a in foreign)
+                and not any(same_amount(money(r.get("amount_brl")), a) for a in own)
+            )
+        ]
+    captured = sum(money(c.get("amount_brl")) for c in captures)
+    if captured > 0:
+        refunds = [r for r in refunds if money(r.get("amount_brl")) <= captured + 0.01]
+    return captures, refunds
+
+
+def _settling_captures(captures: list[dict[str, Any]], expected: float) -> list[dict[str, Any]]:
+    """Smallest set of captures whose amounts add up to the incident's item total."""
+    if expected <= 0:
+        return []
+    for size in range(1, len(captures) + 1):
+        for combo in combinations(captures, size):
+            if same_amount(sum(money(c.get("amount_brl")) for c in combo), expected):
+                return list(combo)
+    return []
 
 
 def _split_subset(rows: list[dict[str, Any]], expected: float) -> list[dict[str, Any]]:
@@ -378,12 +439,16 @@ def analyse_payment(
         for e in (refund_timeline or {}).get("events", []) or []
         if incident.window.contains(e.get("event_at"))
     ]
-    payments = list(payment_timeline.get("payments", []) or [])
+    payments = _unique_payment_rows(payment_timeline.get("payments", []) or [])
     rows = _match_rows(captures, payments)
     if payments and len(rows) < len(captures):
         # A capture with no payment row behind it is a replayed timeline record, not a
         # second charge: a real duplicate charge carries its own payment row.
         captures = _drop_replayed_captures(captures, payments)
+    expected = round(sum(money(i.get("price")) + money(i.get("freight_value")) for i in items), 2)
+    captures, refunds = _attribute_to_incident(captures, refunds, expected)
+    if len(rows) > len(captures):
+        rows = _match_rows(captures, payments)
     captured_total = round(sum(money(e.get("amount_brl")) for e in captures), 2)
     refunded_total = round(
         sum(
@@ -393,7 +458,6 @@ def analyse_payment(
         ),
         2,
     )
-    expected = round(sum(money(i.get("price")) + money(i.get("freight_value")) for i in items), 2)
 
     finding = PaymentFinding("reconciled", captured_total, refunded_total, captures, rows)
     finding.refund_events_in_scope = len(refunds)

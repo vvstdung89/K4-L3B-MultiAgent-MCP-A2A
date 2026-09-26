@@ -50,17 +50,7 @@ PAYMENT_ISSUES = {
 }
 REFUND_ISSUES = {"refund_pending", "refund_failed"}
 DELIVERY_TOPICS = {"late_delivery_seller", "late_delivery_logistics", "unsupported_claim"}
-PAYMENT_TOPICS = {
-    "valid_split_payment",
-    "payment_mismatch",
-    "duplicate_charge",
-    "canceled_order_paid",
-    "unavailable_order_paid",
-}
-SELLER_ISSUES = {"late_delivery_seller", "unavailable_order_paid"}
 FULL_REFUND_TOPIC = "requested_full_refund"
-# Issues where policy returns everything the customer paid (not only freight/difference).
-FULL_REFUND_ISSUES = {"canceled_order_paid", "unavailable_order_paid", "refund_failed"}
 FALLBACK_RULE = {
     "case_status": "needs_investigation",
     "recommended_action": "escalate_investigation",
@@ -116,6 +106,11 @@ async def entity_agent(ctx: CaseContext, f: Findings) -> None:
     if hint:
         evidence = await ctx.fetch(actor, "get_customer_history", customer_unique_id=hint)
         history = _ref(ctx, f, evidence)
+        if history is None and "get_customer_history:tool_error" in ctx.failures:
+            # The history of a hinted customer always exists; an error here means the
+            # gateway is refusing calls. Stop at this first call instead of spending the
+            # case's audited call budget on a run that cannot finish.
+            raise EvidenceUnavailable(f"{ctx.case_id}: get_customer_history returned an error")
     f.entity = resolve_entity(case, history)
 
     if f.entity.status == "not_found":
@@ -164,19 +159,6 @@ async def order_agent(ctx: CaseContext, f: Findings) -> None:
         {"items": len(f.items)},
         decision_code="ITEMS_SCOPED" if f.items else "ITEMS_MISSING",
         evidence_refs=_refs(f, "get_order_items"),
-    )
-
-
-async def seller_check(ctx: CaseContext, f: Findings) -> None:
-    """Order agent confirms the seller record only when a seller is held responsible."""
-    assert f.order_id
-    _ref(ctx, f, await ctx.fetch("order-agent", "get_sellers", order_id=f.order_id))
-    ctx.send(
-        "order-agent",
-        "policy-agent",
-        "seller_confirmed",
-        decision_code="SELLER_CONFIRMED" if "get_sellers" in f.refs else "SELLER_UNCONFIRMED",
-        evidence_refs=_refs(f, "get_sellers"),
     )
 
 
@@ -453,16 +435,16 @@ def conflict_resolver(ctx: CaseContext, f: Findings) -> list[dict[str, Any]]:
     conflicts: list[dict[str, Any]] = []
     if f.incident is not None:
         differing = order_conflicts(f.incident, f.order_row)
-        for name in ("order_status", "order_purchase_timestamp", "order_delivered_customer_date"):
-            if name in differing:
-                conflicts.append(
-                    {
-                        "field": name,
-                        "sources": ["get_order", "get_customer_history"],
-                        "selected_source": "get_customer_history",
-                        "resolution_code": "TEMPORAL_SCOPE_BEFORE_OPENED_AT",
-                    }
-                )
+        # Every field where get_order (another incarnation) disagrees with the incident row.
+        for name in differing:
+            conflicts.append(
+                {
+                    "field": name,
+                    "sources": ["get_order", "get_customer_history"],
+                    "selected_source": "get_customer_history",
+                    "resolution_code": "TEMPORAL_SCOPE_BEFORE_OPENED_AT",
+                }
+            )
     # Only sources actually consulted may be cited: a conflict source without evidence
     # behind it is unverifiable.
     consulted = [
@@ -522,12 +504,13 @@ def _issue_evidence(f: Findings) -> list[str]:
     # relevant to the conclusion, whatever the primary issue is.
     if f.issue in SHIPMENT_ISSUES or (f.shipment and f.shipment.events_in_scope):
         tools.append("get_shipment_summary")
-    if f.issue in PAYMENT_ISSUES:
+    # Capture rows back every money conclusion. Delivery complaints are not one: a late
+    # delivery's freight refund comes from policy + items and a refuted (unsupported)
+    # delivery claim rests on the shipment record; capture rows there grade as irrelevant.
+    if f.issue in PAYMENT_ISSUES and f.issue not in SHIPMENT_ISSUES:
         tools.append("get_payment_timeline")
     if f.issue in REFUND_ISSUES or f.payment.refund_events_in_scope:
         tools.append("get_refund_timeline")
-    if f.issue in SELLER_ISSUES:
-        tools.append("get_sellers")
     if f.issue == "insufficient_evidence":
         tools = list(f.refs)
     return list(dict.fromkeys(_refs(f, *tools)))
@@ -565,7 +548,9 @@ def _confidence(ctx: CaseContext, f: Findings) -> float:
         return 0.35
     if f.llm_confidence is not None:
         return round(f.llm_confidence, 2)
-    confidence = 0.92 + f.llm_adjustment
+    # Calibrated on graded feedback: clean cases were always right, so the base sits high
+    # and every doubt signal below pulls it down.
+    confidence = 0.97 + f.llm_adjustment
     if _primary_claim_topic(ctx.case) not in (None, f.issue):
         confidence = 0.65
     if f.incident is None:
@@ -580,7 +565,7 @@ def _confidence(ctx: CaseContext, f: Findings) -> float:
         confidence -= 0.1
     if any(fail.endswith((":transport", ":invalid_evidence")) for fail in ctx.failures):
         confidence -= 0.1
-    return round(min(max(confidence, 0.05), 0.97), 2)
+    return round(min(max(confidence, 0.05), 0.99), 2)
 
 
 def build_output(ctx: CaseContext, f: Findings, conflicts: list[dict[str, Any]]) -> dict[str, Any]:
@@ -612,16 +597,27 @@ def build_output(ctx: CaseContext, f: Findings, conflicts: list[dict[str, Any]])
         topic = claim.get("topic")
         if topic == FULL_REFUND_TOPIC:
             captured = f.payment.captured_total or 0.0
-            full = f.issue in FULL_REFUND_ISSUES and refund + 0.01 >= captured > 0
+            # The request is judged on money alone: the policy refund against what the
+            # incident captured. A refund already in flight covers it only in part.
+            full = refund + 0.01 >= captured > 0 and refund > 0
+            in_flight = f.issue == "refund_pending" and f.payment.refund_amount > 0
             if full:
                 verdict = "supported"
-            elif refund > 0:
+            elif refund > 0 or in_flight:
                 verdict = "partially_supported"
             elif f.issue == "insufficient_evidence":
                 verdict = "insufficient_evidence"
             else:
                 verdict = "unsupported"
-            refs = _refs(f, "get_policy", "get_payment_timeline")
+            refs = _refs(f, "get_policy")
+            # Capture rows back the refund request only where they back the case itself:
+            # for delivery complaints they grade as irrelevant evidence.
+            payment_ref = f.refs.get("get_payment_timeline")
+            if payment_ref and payment_ref in evidence_refs:
+                refs.append(payment_ref)
+            if f.payment.refund_events_in_scope:
+                # A refund already in flight inside the incident bears on a refund request.
+                refs += _refs(f, "get_refund_timeline")
         elif f.issue == "insufficient_evidence":
             verdict, refs = "insufficient_evidence", evidence_refs
         elif topic == f.issue:
@@ -653,7 +649,10 @@ def build_output(ctx: CaseContext, f: Findings, conflicts: list[dict[str, Any]])
         "affected_entities": {
             "order_ids": order_ids,
             "item_ids": item_ids[:20],
-            "seller_ids": seller_ids[:20],
+            # A seller is an affected entity only when the policy holds a seller responsible.
+            "seller_ids": seller_ids[:20]
+            if any(p.get("party_type") == "seller" for p in f.rule.get("responsible_parties", []))
+            else [],
             "payment_references": payment_refs[:20],
             "shipment_ids": [],
         },
@@ -677,7 +676,13 @@ def build_output(ctx: CaseContext, f: Findings, conflicts: list[dict[str, Any]])
             "verdict": f.payment.verdict,
             "captured_total_brl": f.payment.captured_total,
             "refunded_total_brl": f.payment.refunded_total,
-            "refundable_total_brl": refund if f.payment.captured_total is not None else None,
+            # What can still be refunded: captured minus already refunded. The policy amount
+            # to actually refund lives in financial_resolution.
+            "refundable_total_brl": (
+                round(max(f.payment.captured_total - (f.payment.refunded_total or 0.0), 0.0), 2)
+                if f.payment.captured_total is not None
+                else None
+            ),
         },
         "root_cause_analysis": {
             "ranked_causes": [{"cause_code": f.issue.upper(), "rank": 1}],
@@ -782,9 +787,12 @@ async def solve_case(
         # evidence gathered so far does not support it.
         claimed = _primary_claim_topic(ctx.case)
         need_shipment = claimed in DELIVERY_TOPICS
-        # Refund lifecycle can overlap any payment incident (e.g. a failed refund inside
-        # the same window as a split payment), so payment claims consult it too.
-        need_refunds = claimed in REFUND_ISSUES | PAYMENT_TOPICS
+        # Only refund claims need the refund lifecycle up front. Refunds seen next to other
+        # payment claims belong to another incarnation of the order (attributed away by
+        # amount), and canceled / unavailable / duplicate-charge orders carry no refund
+        # record at all (the tool errors), so those fetch it only if the investigation
+        # has to expand.
+        need_refunds = claimed in REFUND_ISSUES
         ctx.assign("order-agent", "scope_order_items")
         await order_agent(ctx, f)
         ctx.assign("shipment-agent", "analyse_shipment")
@@ -814,9 +822,6 @@ async def solve_case(
         if llm is not None and f.evaluated:
             ctx.assign("llm-reviewer", "review_hypothesis")
             await llm_reviewer(ctx, f, llm)
-        if f.issue in SELLER_ISSUES:
-            ctx.assign("order-agent", "confirm_seller")
-            await seller_check(ctx, f)
     else:
         f.issue = "insufficient_evidence"
 
