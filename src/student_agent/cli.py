@@ -38,7 +38,29 @@ async def _show_tools(root: Path) -> None:
             print(tool)
 
 
-async def _run(root: Path) -> None:
+def _resumable_cases(staging: Path, staged_trace: Path) -> set[str]:
+    """Cases of an interrupted run that are complete: staged output plus a finalized trace.
+
+    The staged trace is rewritten to keep only those cases, so an interrupted run can
+    continue without re-querying MCP for work that already finished."""
+    if not staged_trace.exists():
+        return set()
+    lines = staged_trace.read_text(encoding="utf-8").splitlines(keepends=True)
+    events = []
+    for line in lines:
+        try:
+            events.append((json.loads(line), line))
+        except json.JSONDecodeError:
+            continue  # a torn final line from the interruption
+    finalized = {e["case_id"] for e, _ in events if e.get("event_type") == "case_finalized"}
+    done = {case_id for case_id in finalized if (staging / f"{case_id}.json").exists()}
+    staged_trace.write_text(
+        "".join(line for e, line in events if e.get("case_id") in done), encoding="utf-8"
+    )
+    return done
+
+
+async def _run(root: Path, resume: bool = False) -> None:
     settings = Settings.load(root)
     case_set = load_case_set(root)
     contracts = Contracts(root / "contracts" / "schemas")
@@ -49,8 +71,12 @@ async def _run(root: Path) -> None:
     staged_trace = staging / "trace.jsonl"
     staging.mkdir(parents=True, exist_ok=True)
     trace_path.parent.mkdir(parents=True, exist_ok=True)
+    done = _resumable_cases(staging, staged_trace) if resume else set()
     for stale in staging.iterdir():
-        stale.unlink()
+        if stale != staged_trace and stale.stem not in done:
+            stale.unlink()
+    if not done and staged_trace.exists():
+        staged_trace.unlink()
     trace = TraceWriter(staged_trace, contracts)
 
     llm_settings = LLMSettings.from_env()
@@ -62,7 +88,9 @@ async def _run(root: Path) -> None:
         else "LLM reviewer: disabled (ORCHESTRATOR_* not set)",
         flush=True,
     )
-    pending = list(case_set.case_ids)
+    pending = [case_id for case_id in case_set.case_ids if case_id not in done]
+    if done:
+        print(f"resuming: {len(done)} cases already staged", flush=True)
     reconnects = 0
     while pending:
         try:
@@ -127,7 +155,12 @@ def parser() -> argparse.ArgumentParser:
     commands = result.add_subparsers(dest="command", required=True)
     commands.add_parser("validate-inputs", help="validate case-set.json and all 100 inputs")
     commands.add_parser("mcp-tools", help="authenticate and list discovered MCP tools")
-    commands.add_parser("run", help="run the implemented workflow for all cases")
+    run = commands.add_parser("run", help="run the implemented workflow for all cases")
+    run.add_argument(
+        "--resume",
+        action="store_true",
+        help="continue an interrupted run, keeping the cases already staged",
+    )
     commands.add_parser("validate", help="validate outputs and observable trace")
     package = commands.add_parser("package", help="validate and build the submission ZIP")
     package.add_argument("--output", default="dist/submission.zip")
@@ -146,7 +179,7 @@ def main() -> None:
         elif args.command == "mcp-tools":
             asyncio.run(_show_tools(root))
         elif args.command == "run":
-            asyncio.run(_run(root))
+            asyncio.run(_run(root, resume=args.resume))
         elif args.command == "validate":
             case_set = load_case_set(root)
             contracts = Contracts(root / "contracts" / "schemas")

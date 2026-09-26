@@ -17,7 +17,6 @@ coordinator ──task_assigned──▶ entity-agent ── get_customer_histor
    │          (each hands its verdict back to coordinator)
    ├─ select_hypothesis: re-scope the same evidence per incarnation, test the claim
    ├─task──▶ llm-reviewer (optional) ── fast model, escalate to reasoning model
-   ├─task──▶ order-agent (seller issues only) ── get_sellers
    ├─task──▶ policy-agent ── get_policy ──policy_decided──▶ conflict-resolver
    ├─task──▶ conflict-resolver ──handoff──▶ verifier
    └─task──▶ verifier ──verification_completed──▶ coordinator ──▶ outputs/<case_id>.json
@@ -40,7 +39,7 @@ Source:
 | --- | --- | --- | --- | --- |
 | Entity/customer | case input (candidates, claimed id, customer hint) | resolve order, reject candidate ngoài history, dựng các scope (incarnation) của order | `get_customer_history`, `get_order` | `entity_resolved` → coordinator |
 | Coordinator | handoff của specialist | giao task, re-scope evidence theo từng incarnation, kiểm chứng claim, quyết định escalate LLM | không gọi MCP | task_assigned / hypothesis_selected |
-| Order/product | order id, scope | lấy item/seller, lọc item thuộc incident | `get_order_items`, `get_sellers` (`get_product_context` được phép nhưng không dùng) | `order_items_scoped`, `seller_confirmed` |
+| Order/product | order id, scope | lấy item/seller, lọc item thuộc incident | `get_order_items` (`get_product_context`, `get_sellers` được phép nhưng không dùng: seller id đã có trong item) | `order_items_scoped` |
 | Shipment | scope, items | on_time / seller_delay / logistics_delay / conflicting | `get_shipment_summary` | `shipment_analysed` |
 | Payment/refund | scope, items | capture, split, duplicate, mismatch, refund lifecycle | `get_payment_timeline`, `get_refund_timeline` | `payment_analysed` |
 | LLM reviewer | fact sheet có cấu trúc (không có free-text khiếu nại) | review độc lập; chỉ được chọn trong tập issue có evidence | không gọi MCP | handoff `LLM_*` → coordinator |
@@ -68,6 +67,8 @@ Permission được enforce trong `a2a.TOOL_PERMISSIONS`; gọi tool ngoài quy�
 5. `data_conflicts`:
    - `get_order` vs `get_customer_history` khác nhau ở status/timestamp → chọn history, `TEMPORAL_SCOPE_BEFORE_OPENED_AT`;
    - nhiều anomaly cạnh tranh trong một scope → `SCOPED_TO_CLAIMED_INCIDENT`;
+   - incarnation khác của cùng order có thể trùng cửa sổ incident (cùng timestamp): nếu một tập capture khớp đúng tổng item của incident thì các capture còn lại, và refund cùng số tiền với chúng, thuộc incarnation kia; refund lớn hơn tổng đã capture của incident cũng không thuộc incident;
+   - payment row giống hệt nhau (source replay) được gộp làm một (các chân của split payment có thể trùng `payment_sequential` nhưng khác `payment_type`, nên không gộp); capture không có payment row riêng là bản ghi replay, không phải charge thứ hai;
    - carrier event mâu thuẫn với shipping limit → `UNRESOLVED_SOURCE_CONFLICT` (`selected_source: null`);
    - claim không được evidence hỗ trợ → `EVIDENCE_OVERRIDES_CLAIM`.
 
@@ -81,7 +82,9 @@ Permission được enforce trong `a2a.TOOL_PERMISSIONS`; gọi tool ngoài quy�
 | Source conflict | 0 | chọn source theo thứ tự ở mục 4, không resolve được → `conflicting` | `CONFLICTS_RESOLVED`, `data_conflicts` |
 | Invalid specialist / LLM result | LLM: 1 retry / model | LLM trả issue ngoài tập cho phép hoặc lỗi → bỏ qua, giữ kết quả rule | `LLM_UNAVAILABLE` |
 
-**Query budget (hypothesis-driven)**: luôn gọi 5 tool (customer history, order, items, payment timeline, policy). `get_shipment_summary` chỉ gọi khi claim là giao hàng (late_*/unsupported_claim) vì verdict giao hàng tính được từ timeline trong history + shipping limit của item. `get_refund_timeline` gọi khi claim là refund_* hoặc là claim thanh toán (split, mismatch, duplicate, canceled, unavailable), vì refund event có thể nằm chồng trong cùng cửa sổ của incident thanh toán. `get_sellers` chỉ gọi khi seller chịu trách nhiệm. Nếu evidence không hỗ trợ claim (`CLAIM_UNSUPPORTED_EXPAND`) hoặc trong scope có nhiều anomaly cạnh tranh (`COMPETING_ANOMALIES_EXPAND`), coordinator mở rộng điều tra và gọi các tool còn thiếu; `data_conflicts` chỉ trích dẫn source đã thực sự được gọi. Không gọi `get_product_context` và `get_order_payments` (không đổi kết luận nào), không gọi MCP cho candidate bị reject. Trung bình ≈ 6 call/case (bản đầu 8.3).
+**Query budget (hypothesis-driven)**: luôn gọi 5 tool (customer history, order, items, payment timeline, policy). `get_shipment_summary` chỉ gọi khi claim là giao hàng (late_*/unsupported_claim) vì verdict giao hàng tính được từ timeline trong history + shipping limit của item. `get_refund_timeline` chỉ gọi khi claim là refund_*: refund xuất hiện cạnh các claim thanh toán khác thuộc incarnation khác của order, còn order canceled / unavailable / duplicate charge không có refund record (tool báo lỗi nhưng call vẫn bị audit); các trường hợp đó chỉ gọi khi phải mở rộng điều tra. Không gọi `get_sellers`: seller id và trách nhiệm đã xác định từ item + shipping limit, hồ sơ seller (địa chỉ) không đổi kết luận. Nếu evidence không hỗ trợ claim (`CLAIM_UNSUPPORTED_EXPAND`) hoặc trong scope có nhiều anomaly cạnh tranh (`COMPETING_ANOMALIES_EXPAND`), coordinator mở rộng điều tra và gọi các tool còn thiếu; `data_conflicts` chỉ trích dẫn source đã thực sự được gọi. Không gọi `get_product_context` và `get_order_payments` (không đổi kết luận nào), không gọi MCP cho candidate bị reject. Trung bình ≈ 5.5 call/case (bản đầu 8.4).
+
+**Evidence output**: 4 domain lõi (customer history, order, items, policy) cộng domain mang kết luận — shipment cho late_* / unsupported_claim, payment cho mọi issue có kết luận về tiền (kể cả refund_*; không gồm late_* và unsupported_claim — khiếu nại giao hàng — vì payment ở đó bị chấm là evidence thừa), thêm refund cho refund_*. Hồ sơ seller (`get_sellers`) không đưa vào: bỏ nó làm tăng efficiency mà evidence không giảm, trong khi bỏ payment khỏi refund / unsupported làm evidence giảm.
 
 **Trace nguyên tử theo case**: event được đệm trong bộ nhớ và chỉ ghi khi case finalize. Nếu session MCP chết giữa case, toàn bộ event và evidence ref của lần chạy dở bị bỏ, case được điều tra lại từ đầu trong session mới, nên trace không còn ref "mồ côi" thuộc run/session khác.
 
